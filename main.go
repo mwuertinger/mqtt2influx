@@ -3,13 +3,14 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var config *Config
 var influxClient influxdb.Client
 
 func main() {
@@ -27,7 +29,8 @@ func main() {
 	if len(os.Args) != 2 {
 		log.Fatal("Usage: %s <config>", os.Args[0])
 	}
-	config, err := parseConfig(os.Args[1])
+	var err error
+	config, err = parseConfig(os.Args[1])
 	if err != nil {
 		log.Fatalf("loading config failed: %v", err)
 	}
@@ -46,7 +49,7 @@ func main() {
 	}
 	err = mqttClient.Subscribe(&client.SubscribeOptions{SubReqs: []*client.SubReq{{
 		TopicFilter: []byte("sensorbox/measurements"),
-		Handler: mqttHandler,
+		Handler:     mqttHandler,
 	}}})
 	if err != nil {
 		log.Fatalf("mqtt subscribe failed: %v", err)
@@ -63,36 +66,111 @@ func main() {
 
 // measurements is used to parse the sensorbox data
 type measurements struct {
-	Client      string  `json:"C"`
-	Time        int64   `json:"T"`
-	Pressure    float64 `json:"p"`
-	Humidity    float64 `json:"h"`
-	Temperature float64 `json:"t"`
-	CO2         int32   `json:"c"`
+	Location    string
+	ClockDrift  int64
+	Uptime      int64
+	Pressure    float64
+	Humidity    float64
+	Temperature float64
+	CO2         int
 }
 
 // mqttHandler called for every MQTT message
 func mqttHandler(topic, message []byte) {
-	var m measurements
-	if err := json.Unmarshal(message, &m); err != nil {
-		log.Printf("unmarshal: %v", err)
+	m, err := parseMessage(message)
+	if err != nil {
+		log.Printf("parseMessage: %v", err)
 		return
 	}
-	writeToInflux(m)
+	log.Printf("%+v", m)
+	if err := writeToInflux(m); err != nil {
+		log.Printf("writeToInflux: %v", err)
+	}
+}
+
+// parseMessage parses a CSV message from a sensorbox
+func parseMessage(message []byte) (*measurements, error) {
+	var m measurements
+	tokens := strings.Split(string(message), ",")
+	if len(tokens) < 6 {
+		return nil, fmt.Errorf("mqttHandler: not enough fields: %s", string(message))
+	}
+
+	devId, err := strconv.Atoi(tokens[0])
+	if err != nil {
+		return nil, fmt.Errorf("devId: %w", err)
+	}
+	dev, ok := config.Devices[devId]
+	if !ok {
+		return nil, fmt.Errorf("unknown device: %d", devId)
+	}
+	m.Location = dev.Location
+
+	t, err := strconv.ParseInt(tokens[1], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("time: %w", err)
+	}
+	m.ClockDrift = time.Now().Unix() - t
+
+	m.Uptime, err = strconv.ParseInt(tokens[2], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("uptime: %w", err)
+	}
+
+	m.Pressure, err = strconv.ParseFloat(tokens[3], 64)
+	if err != nil {
+		return nil, fmt.Errorf("pressur: %v", err)
+	}
+
+	m.Humidity, err = strconv.ParseFloat(tokens[4], 64)
+	if err != nil {
+		return nil, fmt.Errorf("humidity: %v", err)
+	}
+
+	m.Temperature, err = strconv.ParseFloat(tokens[5], 64)
+	if err != nil {
+		return nil, fmt.Errorf("temperature: %v", err)
+	}
+
+	m.CO2, err = strconv.Atoi(tokens[6])
+	if err != nil {
+		return nil, fmt.Errorf("co2: %v", err)
+	}
+
+	return &m, nil
 }
 
 // writeToInflux writes measurements to InfluxDB
-func writeToInflux(m measurements) error {
-	// calculate sensorbox clockdrift
-	cd := time.Now().Unix() - m.Time
-
+func writeToInflux(m *measurements) error {
 	// Create a new point batch
-	bp, _ := influxdb.NewBatchPoints(influxdb.BatchPointsConfig{
+	bp, err := influxdb.NewBatchPoints(influxdb.BatchPointsConfig{
 		Database:  "sensors",
 		Precision: "s",
 	})
-	tags := map[string]string{"client": m.Client}
-	fields := map[string]interface{}{"pressure": m.Pressure, "humidity": m.Humidity, "temperature": m.Temperature, "co2": m.CO2, "clockdrift": cd}
+	if err != nil {
+		return err
+	}
+	tags := map[string]string{"location": m.Location}
+	fields := map[string]interface{}{}
+	fields["clockdrift"] = m.ClockDrift
+	if m.Pressure > 0 {
+		fields["pressure"] = m.Pressure
+	}
+	if m.Uptime > 0 {
+		fields["uptime"] = m.Uptime
+	}
+	if m.Humidity > 0 {
+		fields["humidity"] = m.Humidity
+	}
+	if m.Temperature > 0 {
+		fields["temperature"] = m.Temperature - 273.15 // convert to °C
+	}
+	if m.CO2 > 0 {
+		fields["co2"] = m.CO2
+	}
+
+	log.Printf("writing to influx: %+v", fields)
+
 	pt, err := influxdb.NewPoint("measurements", tags, fields, time.Now())
 	if err != nil {
 		return err
@@ -149,8 +227,9 @@ func newMqttClient(config *Config) (*client.Client, error) {
 
 // Config represents a config file
 type Config struct {
-	Mqtt   MqttConfig   `yaml:"mqtt"`
-	Influx InfluxConfig `yaml:"influx"`
+	Mqtt    MqttConfig     `yaml:"mqtt"`
+	Influx  InfluxConfig   `yaml:"influx"`
+	Devices map[int]Device `yaml:"devices"`
 }
 
 type MqttConfig struct {
@@ -163,6 +242,10 @@ type MqttConfig struct {
 type InfluxConfig struct {
 	Server string `yaml:"server"`
 	Token  string `yaml:"token"`
+}
+
+type Device struct {
+	Location string `yaml:location`
 }
 
 // parseConfig reads config file at path and returns the content or an error
