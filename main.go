@@ -245,7 +245,7 @@ type InfluxConfig struct {
 }
 
 type Device struct {
-	Location string `yaml:location`
+	Location string `yaml:"location"`
 }
 
 // parseConfig reads config file at path and returns the content or an error
