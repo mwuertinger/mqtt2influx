@@ -27,7 +27,7 @@ func main() {
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 
 	if len(os.Args) != 2 {
-		log.Fatal("Usage: %s <config>", os.Args[0])
+		log.Fatalf("Usage: %s <config>", os.Args[0])
 	}
 	var err error
 	config, err = parseConfig(os.Args[1])
