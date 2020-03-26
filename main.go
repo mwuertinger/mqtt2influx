@@ -18,36 +18,50 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type MqttConfig struct {
-	Server string `yaml:"server"`
-	CaPath string `yaml:"caPath"`
-	User   string `yaml:"user"`
-	Passwd string `yaml:"passwd"`
-}
+var influxClient influxdb.Client
 
-type InfluxConfig struct {
-	Server string `yaml:"server"`
-	Token  string `yaml:"token"`
-}
+func main() {
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 
-type Config struct {
-	Mqtt   MqttConfig   `yaml:"mqtt"`
-	Influx InfluxConfig `yaml:"influx"`
-}
-
-func parseConfig(path string) (*Config, error) {
-	buf, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, err
+	if len(os.Args) != 2 {
+		log.Fatal("Usage: %s <config>", os.Args[0])
 	}
-	var config Config
-	err = yaml.Unmarshal(buf, &config)
+	config, err := parseConfig(os.Args[1])
 	if err != nil {
-		return nil, err
+		log.Fatalf("loading config failed: %v", err)
 	}
-	return &config, nil
+
+	influxClient, err = influxdb.NewHTTPClient(influxdb.HTTPConfig{
+		Addr: config.Influx.Server,
+	})
+	if err != nil {
+		log.Println("Error creating InfluxDB Client: ", err.Error())
+		return
+	}
+
+	mqttClient, err := newMqttClient(config)
+	if err != nil {
+		log.Fatalf("creating mqtt client failed: %v", err)
+	}
+	err = mqttClient.Subscribe(&client.SubscribeOptions{SubReqs: []*client.SubReq{{
+		TopicFilter: []byte("sensorbox/measurements"),
+		Handler: mqttHandler,
+	}}})
+	if err != nil {
+		log.Fatalf("mqtt subscribe failed: %v", err)
+	}
+
+	<-sigc
+	if err = mqttClient.Disconnect(); err != nil {
+		log.Printf("MQTT disconnect: %v", err)
+	}
+	if err := influxClient.Close(); err != nil {
+		log.Printf("Influx close: %v", err)
+	}
 }
 
+// measurements is used to parse the sensorbox data
 type measurements struct {
 	Client      string  `json:"C"`
 	Time        int64   `json:"T"`
@@ -57,72 +71,42 @@ type measurements struct {
 	CO2         int32   `json:"c"`
 }
 
-func main() {
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-
-	config, err := parseConfig(os.Args[1])
-	if err != nil {
-		log.Fatalf("loading config failed: %v", err)
-	}
-
-	c, err := influxdb.NewHTTPClient(influxdb.HTTPConfig{
-		Addr: config.Influx.Server,
-	})
-	if err != nil {
-		log.Println("Error creating InfluxDB Client: ", err.Error())
+// mqttHandler called for every MQTT message
+func mqttHandler(topic, message []byte) {
+	var m measurements
+	if err := json.Unmarshal(message, &m); err != nil {
+		log.Printf("unmarshal: %v", err)
 		return
 	}
-	defer c.Close()
-
-	mqttClient, err := newMqttClient(config)
-	if err != nil {
-		log.Fatalf("creating mqtt client failed: %v", err)
-	}
-	err = mqttClient.Subscribe(&client.SubscribeOptions{SubReqs: []*client.SubReq{{
-		TopicFilter: []byte("sensorbox/measurements"),
-		Handler: func(topicName, message []byte) {
-			log.Printf("MQTT message: %s", string(message))
-			var m measurements
-			if err := json.Unmarshal(message, &m); err != nil {
-				log.Printf("unmarshal: %v", err)
-				return
-			}
-			writeToInflux(c, m)
-		},
-	}}})
-	if err != nil {
-		log.Fatalf("mqtt subscribe failed: %v", err)
-	}
-
-	<-sigc
-	err = mqttClient.Disconnect()
-	if err != nil {
-		log.Printf("MQTT disconnect: %v", err)
-	}
+	writeToInflux(m)
 }
 
-func writeToInflux(c influxdb.Client, m measurements) {
+// writeToInflux writes measurements to InfluxDB
+func writeToInflux(m measurements) error {
+	// calculate sensorbox clockdrift
+	cd := time.Now().Unix() - m.Time
+
 	// Create a new point batch
 	bp, _ := influxdb.NewBatchPoints(influxdb.BatchPointsConfig{
 		Database:  "sensors",
 		Precision: "s",
 	})
 	tags := map[string]string{"client": m.Client}
-	fields := map[string]interface{}{"pressure": m.Pressure, "humidity": m.Humidity, "temperature": m.Temperature, "co2": m.CO2}
+	fields := map[string]interface{}{"pressure": m.Pressure, "humidity": m.Humidity, "temperature": m.Temperature, "co2": m.CO2, "clockdrift": cd}
 	pt, err := influxdb.NewPoint("measurements", tags, fields, time.Now())
 	if err != nil {
-		fmt.Println("Error: ", err.Error())
-		return
+		return err
 	}
 	bp.AddPoint(pt)
 
 	// Write the batch
-	if err := c.Write(bp); err != nil {
-		log.Printf("write: %v", err)
+	if err := influxClient.Write(bp); err != nil {
+		return err
 	}
+	return nil
 }
 
+// newMqttClient create MQTT client
 func newMqttClient(config *Config) (*client.Client, error) {
 	caCert, err := ioutil.ReadFile(config.Mqtt.CaPath)
 	if err != nil {
@@ -161,4 +145,36 @@ func newMqttClient(config *Config) (*client.Client, error) {
 		return nil, fmt.Errorf("MQTT connect: %w", err)
 	}
 	return mqttClient, nil
+}
+
+// Config represents a config file
+type Config struct {
+	Mqtt   MqttConfig   `yaml:"mqtt"`
+	Influx InfluxConfig `yaml:"influx"`
+}
+
+type MqttConfig struct {
+	Server string `yaml:"server"`
+	CaPath string `yaml:"caPath"`
+	User   string `yaml:"user"`
+	Passwd string `yaml:"passwd"`
+}
+
+type InfluxConfig struct {
+	Server string `yaml:"server"`
+	Token  string `yaml:"token"`
+}
+
+// parseConfig reads config file at path and returns the content or an error
+func parseConfig(path string) (*Config, error) {
+	buf, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var config Config
+	err = yaml.Unmarshal(buf, &config)
+	if err != nil {
+		return nil, err
+	}
+	return &config, nil
 }
