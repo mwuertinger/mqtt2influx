@@ -66,13 +66,14 @@ func main() {
 
 // measurements is used to parse the sensorbox data
 type measurements struct {
-	Location    string
-	ClockDrift  int64
-	Uptime      int64
-	Pressure    float64
-	Humidity    float64
-	Temperature float64
-	CO2         int
+	Location     string
+	ClockDrift   int64
+	Uptime       int64
+	Pressure     float64
+	Humidity     float64
+	Temperature  float64
+	CO2          int
+	SoilMoisture int
 }
 
 // mqttHandler called for every MQTT message
@@ -137,6 +138,13 @@ func parseMessage(message []byte) (*measurements, error) {
 		return nil, fmt.Errorf("co2: %v", err)
 	}
 
+	if len(tokens) > 7 {
+		m.SoilMoisture, err = strconv.Atoi(tokens[7])
+		if err != nil {
+			return nil, fmt.Errorf("soilMoisture: %v", err)
+		}
+	}
+
 	return &m, nil
 }
 
@@ -167,6 +175,9 @@ func writeToInflux(m *measurements) error {
 	}
 	if m.CO2 > 0 {
 		fields["co2"] = m.CO2
+	}
+	if m.SoilMoisture > 0 {
+		fields["soil_moisture"] = m.SoilMoisture
 	}
 
 	log.Printf("writing to influx: %+v", fields)
